@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# Data (large files)
+data/raw/
+data/preprocessed/
+
+# Results (weights are large)
+results/weights/
+
+# Keep plots and logs
+!results/plots/
+!results/logs/
+
+# Kaggle credentials (NEVER commit)
+.kaggle/
+kaggle.json
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
