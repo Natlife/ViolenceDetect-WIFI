@@ -13,12 +13,11 @@ IS_COLAB = "COLAB_GPU" in os.environ or "google.colab" in str(os.environ.get("PA
 BASE_DIR = Path(__file__).parent.resolve()
 
 if IS_COLAB:
-    # Mount Google Drive: from google.colab import drive; drive.mount('/content/drive')
     DRIVE_ROOT = Path("/content/drive/MyDrive/WiFi-BullyDetect")
-    DATA_ROOT  = DRIVE_ROOT / "data"
+    DATA_ROOT  = DRIVE_ROOT / "wifi_violence_processed_loc"
     RESULT_DIR = DRIVE_ROOT / "results"
 else:
-    DATA_ROOT  = BASE_DIR / "data"
+    DATA_ROOT  = BASE_DIR / "data" / "wifi_violence_processed_loc"
     RESULT_DIR = BASE_DIR / "results"
 
 # Dataset paths 
@@ -34,8 +33,23 @@ WEIGHTS_DIR = RESULT_DIR / "weights"
 PLOTS_DIR   = RESULT_DIR / "plots"
 LOGS_DIR    = RESULT_DIR / "logs"
 
-# Classes
-CLASSES = ["normal", "bullying"]   # 0 = normal, 1 = bullying
+# ── Task & Classes ──────────────────────────────────────────────────────────
+# TASK = "multiclass" : identify 7 actions (label 1-7 → index 0-6)
+# TASK = "binary"     : bina (label 1=normal, 2-7=violent)
+TASK = "multiclass"
+
+if TASK == "binary":
+    CLASSES = ["normal", "violent"]
+else:
+    CLASSES = [
+        "normal",    # label 1
+        "violent_1", # label 2
+        "violent_2", # label 3
+        "violent_3", # label 4
+        "violent_4", # label 5
+        "violent_5", # label 6
+        "violent_6", # label 7
+    ]
 NUM_CLASSES = len(CLASSES)
 
 # CSI / Signal settings
@@ -107,6 +121,7 @@ def to_dict():
     """Export config as dict (for logging)."""
     return {
         "IS_COLAB": IS_COLAB,
+        "TASK": TASK,
         "MODEL_NAME": MODEL_NAME,
         "NUM_CLASSES": NUM_CLASSES,
         "CLASSES": CLASSES,

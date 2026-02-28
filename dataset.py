@@ -1,131 +1,213 @@
+"""
+  <data>/
+    train/
+    test/
+    mean_std/
+      mean_std_0.h5
+      ...
+      mean_std_7.h5
+    train_list.csv
+    test_list.csv
+"""
 
-import os
+import csv
 import random
-import numpy as np
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import List, Tuple, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 import config
 
-
-# Augmentation helpers
-
-def augment_add_noise(x: np.ndarray) -> np.ndarray:
-    return x + np.random.normal(0, config.AUGMENT_NOISE_STD, x.shape)
+_mean_std_cache: dict = {}
 
 
-def augment_flip(x: np.ndarray) -> np.ndarray:
+def _load_mean_std(mean_std_dir: Path, label_idx: int) -> Tuple:
+    if label_idx in _mean_std_cache:
+        return _mean_std_cache[label_idx]
+
+    h5_path = mean_std_dir / f"mean_std_{label_idx}.h5"
+    if not h5_path.exists():
+        _mean_std_cache[label_idx] = (None, None)
+        return (None, None)
+
+    try:
+        import h5py
+        with h5py.File(h5_path, "r") as f:
+            keys = list(f.keys())
+            mean_key = "mean" if "mean" in keys else keys[0]
+            std_key  = "std"  if "std"  in keys else (keys[1] if len(keys) > 1 else keys[0])
+            mean = f[mean_key][:].astype(np.float32)
+            std  = f[std_key][:].astype(np.float32)
+            std  = np.where(std < 1e-8, 1.0, std)
+        _mean_std_cache[label_idx] = (mean, std)
+        return (mean, std)
+    except Exception as e:
+        print(f"[WARN] Không đọc được {h5_path}: {e}")
+        _mean_std_cache[label_idx] = (None, None)
+        return (None, None)
+
+def _read_h5_sample(h5_path: Path) -> np.ndarray:
+    """Read csi signal -> shape (C, T)."""
+    import h5py
+    with h5py.File(h5_path, "r") as f:
+        keys = list(f.keys())
+        data_key = next(
+            (k for k in ["data", "csi", "X", "csi_data", "amplitude"] if k in keys),
+            keys[0]
+        )
+        arr = f[data_key][:].astype(np.float32)
+
+    if arr.ndim == 1:
+        arr = arr[np.newaxis, :]
+    elif arr.ndim == 2:
+        if arr.shape[0] > arr.shape[1]:
+            arr = arr.T
+    elif arr.ndim == 3:
+        max_ax = np.argmax(arr.shape)
+        if max_ax == 2:   # (..., T)
+            arr = arr.reshape(-1, arr.shape[2])
+        else:             # (T, ...)
+            arr = arr.reshape(arr.shape[0], -1).T
+    return arr  # (C, T)
+
+def _normalize(arr: np.ndarray, mean, std) -> np.ndarray:
+    if mean is None:
+        m = arr.mean(axis=-1, keepdims=True)
+        s = arr.std(axis=-1, keepdims=True) + 1e-8
+        return (arr - m) / s
+    m = np.array(mean).reshape(-1, 1) if np.ndim(mean) >= 1 else mean
+    s = np.array(std).reshape(-1, 1)  if np.ndim(std)  >= 1 else std
+    return (arr - m) / (s + 1e-8)
+
+
+def _resize_time(arr: np.ndarray, target_T: int) -> np.ndarray:
+    _, T = arr.shape
+    if T == target_T:
+        return arr
+    try:
+        import scipy.ndimage
+        return scipy.ndimage.zoom(arr, (1, target_T / T), order=1)
+    except ImportError:
+        idx = np.linspace(0, T - 1, target_T)
+        left = np.floor(idx).astype(int)
+        right = np.minimum(left + 1, T - 1)
+        frac = (idx - left)[np.newaxis, :]
+        return arr[:, left] * (1 - frac) + arr[:, right] * frac
+
+
+def _sliding_windows(arr: np.ndarray, window: int, stride: int) -> List[np.ndarray]:
+    _, T = arr.shape
+    wins = []
+    s = 0
+    while s + window <= T:
+        wins.append(arr[:, s:s + window])
+        s += stride
+    if not wins:
+        wins.append(_resize_time(arr, window))
+    return wins
+
+def _augment(x: np.ndarray) -> np.ndarray:
+    x = x + np.random.normal(0, config.AUGMENT_NOISE_STD, x.shape).astype(np.float32)
     if random.random() < config.AUGMENT_FLIP_PROB:
-        return np.flip(x, axis=-1).copy()
-    return x
-
-
-def augment_scale(x: np.ndarray) -> np.ndarray:
+        x = np.flip(x, axis=-1).copy()
     lo, hi = config.AUGMENT_SCALE_RANGE
-    scale = random.uniform(lo, hi)
-    return x * scale
+    return x * random.uniform(lo, hi)
 
+def _map_label(raw_label: int) -> int:
+    if config.TASK == "binary":
+        return 0 if raw_label == 1 else 1
+    return raw_label - 1
 
-# Dataset
-
-class BullyDataset(Dataset):
-    """
-    WiFi CSI bullying detection dataset.
-
-    Expects .npy files with shape (samples, subcarriers, time)
-    or a directory of per-sample .npy files with naming: <label>_<id>.npy
-    where label is 0 (normal) or 1 (bullying).
-    """
+class WiFiViolenceDataset(Dataset):
 
     def __init__(
         self,
+        csv_path: Path,
         data_dir: Path,
-        split: str = "train",          # "train" | "val" | "test"
-        transform=None,
+        mean_std_dir: Path,
+        split: str = "train",
         augment: bool = False,
+        use_sliding_window: bool = True,
+        val_ratio: float = 0.15,
     ):
         self.data_dir = Path(data_dir)
+        self.mean_std_dir = Path(mean_std_dir)
         self.split = split
-        self.transform = transform
         self.augment = augment and (split == "train")
+        self.use_sliding_window = use_sliding_window
 
-        self.samples: List[np.ndarray] = []
-        self.labels: List[int] = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            all_rows = list(csv.DictReader(f))
 
-        self._load()
-
-    # loading
-
-    def _load(self):
-        split_dir = self.data_dir / self.split
-        x_file    = split_dir / "X.npy"
-        y_file    = split_dir / "y.npy"
-
-        if x_file.exists() and y_file.exists():
-            # Format 1: pre-split X.npy / y.npy
-            X = np.load(x_file).astype(np.float32)
-            y = np.load(y_file).astype(np.int64)
-            self.samples = [X[i] for i in range(len(X))]
-            self.labels  = y.tolist()
-
-        elif (self.data_dir / "X.npy").exists():
-            # Format 2: single X.npy + y.npy at root (will be split by index)
-            raise ValueError(
-                "Found X.npy at root but not in split dirs. "
-                "Run scripts/prepare_dataset.py first."
-            )
-
+        if split in ("train", "val"):
+            rng = np.random.default_rng(config.RANDOM_SEED)
+            idx = np.arange(len(all_rows))
+            rng.shuffle(idx)
+            n_val = int(len(idx) * val_ratio)
+            rows = [all_rows[i] for i in (idx[:n_val] if split == "val" else idx[n_val:])]
         else:
-            # Format 3: individual per-sample .npy files  <label>_<id>.npy
-            files = sorted(split_dir.glob("*.npy"))
-            if len(files) == 0:
-                raise FileNotFoundError(
-                    f"No data found in {split_dir}. "
-                    "Run scripts/prepare_dataset.py to preprocess the dataset."
-                )
-            for f in files:
-                label = int(f.stem.split("_")[0])
-                arr   = np.load(f).astype(np.float32)
-                self.samples.append(arr)
-                self.labels.append(label)
+            rows = all_rows
 
-        print(f"[{self.split}] loaded {len(self.samples)} samples | "
-              f"classes: {dict(zip(*np.unique(self.labels, return_counts=True)))}")
+        self.samples: List[Tuple[Path, int, int]] = []
+        missing = 0
+        for row in rows:
+            fname = row["file"].strip()
+            raw_label = int(row["label"])
+            h5_file = self.data_dir / f"{fname}.h5"
+            if not h5_file.exists():
+                missing += 1
+                continue
+            self.samples.append((h5_file, _map_label(raw_label), raw_label))
 
-    # augment
+        if missing:
+            print(f"[WARN] [{split}] {missing}/{len(rows)} files không tìm thấy trong {self.data_dir}")
 
-    def _apply_augment(self, x: np.ndarray) -> np.ndarray:
-        x = augment_add_noise(x)
-        x = augment_flip(x)
-        x = augment_scale(x)
-        return x
-
-    # Dataset interface
+        # Log
+        lbl_counts: dict = {}
+        for _, lbl, _ in self.samples:
+            lbl_counts[lbl] = lbl_counts.get(lbl, 0) + 1
+        print(f"[{split}] {len(self.samples)} samples | labels: {dict(sorted(lbl_counts.items()))}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.samples[idx].copy()
-        y = self.labels[idx]
+        h5_path, mapped_label, raw_label = self.samples[idx]
 
+        try:
+            arr = _read_h5_sample(h5_path)
+        except Exception as e:
+            print(f"[ERROR] {h5_path.name}: {e}")
+            arr = np.zeros((config.NUM_SUBCARRIERS, config.WINDOW_SIZE), dtype=np.float32)
+
+        mean, std = _load_mean_std(self.mean_std_dir, raw_label)
+        arr = _normalize(arr, mean, std)
+
+        if self.use_sliding_window:
+            wins = _sliding_windows(arr, config.WINDOW_SIZE, config.STRIDE)
+            arr = wins[random.randint(0, len(wins) - 1)] if self.split == "train" else wins[0]
+        else:
+            arr = _resize_time(arr, config.WINDOW_SIZE)
+
+        C = arr.shape[0]
+        if C > config.NUM_SUBCARRIERS:
+            arr = arr[:config.NUM_SUBCARRIERS, :]
+        elif C < config.NUM_SUBCARRIERS:
+            arr = np.concatenate(
+                [arr, np.zeros((config.NUM_SUBCARRIERS - C, arr.shape[1]), dtype=np.float32)], axis=0
+            )
+
+        # Augment
         if self.augment:
-            x = self._apply_augment(x)
+            arr = _augment(arr)
 
-        if self.transform:
-            x = self.transform(x)
-
-        # Ensure shape is (C, T) or (C, H, W) — at minimum 2D
-        if x.ndim == 1:
-            x = x[np.newaxis, :]  # (1, T)
-
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
-
-
-# DataLoader factory
+        return (
+            torch.tensor(arr.astype(np.float32), dtype=torch.float32),
+            torch.tensor(mapped_label, dtype=torch.long),
+        )
 
 def get_dataloaders(
     data_dir: Optional[Path] = None,
@@ -133,16 +215,39 @@ def get_dataloaders(
     num_workers: int = config.NUM_WORKERS,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     if data_dir is None:
-        data_dir = config.PREPROCESSED_DATA_DIR
+        data_dir = config.DATA_ROOT
 
-    train_ds = BullyDataset(data_dir, split="train", augment=config.USE_AUGMENTATION)
-    val_ds   = BullyDataset(data_dir, split="val",   augment=False)
-    test_ds  = BullyDataset(data_dir, split="test",  augment=False)
+    data_dir = Path(data_dir)
+    train_dir    = data_dir / "train"
+    test_dir     = data_dir / "test"
+    mean_std_dir = data_dir / "mean_std"
+    train_csv    = data_dir / "train_list.csv"
+    test_csv     = data_dir / "test_list.csv"
+
+    for p in [train_dir, test_dir, train_csv, test_csv]:
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Not found: {p}\n"
+                "Need exactly DATA_ROOT trong config.py:\n"
+                "  train/  test/  mean_std/  train_list.csv  test_list.csv"
+            )
+
+    train_ds = WiFiViolenceDataset(
+        csv_path=train_csv, data_dir=train_dir, mean_std_dir=mean_std_dir,
+        split="train", augment=config.USE_AUGMENTATION, use_sliding_window=True,
+    )
+    val_ds = WiFiViolenceDataset(
+        csv_path=train_csv, data_dir=train_dir, mean_std_dir=mean_std_dir,
+        split="val", augment=False, use_sliding_window=True,
+    )
+    test_ds = WiFiViolenceDataset(
+        csv_path=test_csv, data_dir=test_dir, mean_std_dir=mean_std_dir,
+        split="test", augment=False, use_sliding_window=False,
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=config.PIN_MEMORY,
-        drop_last=True,
+        num_workers=num_workers, pin_memory=config.PIN_MEMORY, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
@@ -152,5 +257,4 @@ def get_dataloaders(
         test_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=config.PIN_MEMORY,
     )
-
     return train_loader, val_loader, test_loader

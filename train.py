@@ -43,7 +43,8 @@ def parse_args():
     p.add_argument("--lr",        type=float, default=config.LEARNING_RATE)
     p.add_argument("--batch",     type=int, default=config.BATCH_SIZE)
     p.add_argument("--workers",   type=int, default=config.NUM_WORKERS)
-    p.add_argument("--data_dir",  type=str, default=str(config.PREPROCESSED_DATA_DIR))
+    p.add_argument("--data_dir",  type=str, default=str(config.DATA_ROOT),
+                   help="Required folder train/, test/, mean_std/, train_list.csv, test_list.csv")
     p.add_argument("--eval_only", action="store_true",
                    help="Skip training, only evaluate best checkpoint")
     return p.parse_args()
